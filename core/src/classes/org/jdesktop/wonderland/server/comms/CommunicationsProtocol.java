@@ -55,6 +55,8 @@ public interface CommunicationsProtocol extends Serializable {
      * @return the session manager that will be used to handle client sessions
      * from this manager.
      */
-    public ClientSessionListener createSessionListener(ClientSession session,
-                                                       ProtocolVersion version);
+//    public ClientSessionListener createSessionListener(ClientSession session,
+//                                                       ProtocolVersion version);
+
+    public ClientSessionListener createSessionListener(ClientSession session, ProtocolVersion pver, CommunicationsProtocol cp);
 }

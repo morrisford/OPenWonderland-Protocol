@@ -44,8 +44,14 @@ public class WonderlandClientCommsProtocol implements CommunicationsProtocol {
     }
 
     public ClientSessionListener createSessionListener(ClientSession session, 
-                                                       ProtocolVersion version) 
+                                                       ProtocolVersion version,
+                                                       CommunicationsProtocol cp)
     {
-        return new WonderlandSessionListener(session);        
+        return new WonderlandSessionListener(session, cp);
     }
+
+//    public ClientSessionListener createSessionListener(ClientSession session, ProtocolVersion version) {
+//        return new WonderlandSessionListener(session);
+//    }
+
 }

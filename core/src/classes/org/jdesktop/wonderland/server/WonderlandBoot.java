@@ -28,6 +28,7 @@ import org.jdesktop.wonderland.common.annotation.Plugin;
 import org.jdesktop.wonderland.common.utils.ScannedClassLoader;
 import org.jdesktop.wonderland.server.comms.ProtocolSessionListener;
 import org.jdesktop.wonderland.server.comms.WonderlandClientCommsProtocol;
+import org.jdesktop.wonderland.server.comms.XYZZYCommsProtocol;
 
 /**
  * SGS Boot class for Wonderland
@@ -51,6 +52,9 @@ public class WonderlandBoot implements AppListener, Serializable {
         WonderlandContext.getCommsManager().registerProtocol(
                 new WonderlandClientCommsProtocol());
         
+        WonderlandContext.getCommsManager().registerProtocol(
+                new XYZZYCommsProtocol());
+
         // load all plugins
         loadPlugins();
         
@@ -72,8 +76,11 @@ public class WonderlandBoot implements AppListener, Serializable {
      * proper protocol for the client.
      */
     public ClientSessionListener loggedIn(ClientSession session) {
+System.out.println("************************************************       loggedIn");
         logger.info("New session " + session.getName() + " logged in");
-        
+
+
+//        return new ProtocolSessionListener(new XYZZYClientSession(session));
         return new ProtocolSessionListener(session);
     }
     

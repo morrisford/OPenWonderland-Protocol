@@ -44,14 +44,23 @@ import com.sun.sgs.app.ManagedObject;
 import com.sun.sgs.app.ManagedReference;
 import java.io.Serializable;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.Charset;
+import java.nio.charset.CharsetDecoder;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.jdesktop.wonderland.common.comms.DefaultProtocolVersion;
+import org.jdesktop.wonderland.common.comms.ProtocolVersion;
 import org.jdesktop.wonderland.common.comms.SessionInternalConnectionType;
+import org.jdesktop.wonderland.common.comms.WonderlandProtocolVersion;
 import org.jdesktop.wonderland.common.messages.ErrorMessage;
 import org.jdesktop.wonderland.common.messages.Message;
 import org.jdesktop.wonderland.common.messages.MessageID;
@@ -100,6 +109,7 @@ public class ProtocolSessionListener
      * @param session the session connected to this listener
      */
     public ProtocolSessionListener(ClientSession session) {
+        System.out.println("************************** TTTTTTTTTTTTTTTTTTTT  In ProtocolSessionListener constructor ");
         DataManager dm = AppContext.getDataManager();
         sessionRef = dm.createReference(session);
     }
@@ -108,6 +118,7 @@ public class ProtocolSessionListener
      * Initialize the session listener
      */
     public static void initialize() {
+        System.out.println("************************ TTTTTTTTTTTTTTTTTTT In ProtocolSessionListener in initialize");
         DataManager dm = AppContext.getDataManager();
         
         // create map from protocols to clients
@@ -120,69 +131,145 @@ public class ProtocolSessionListener
      * simply forward the data to the delegate session
      * @param data the message data
      */
-    public void receivedMessage(ByteBuffer data) {
-       
+    public void receivedMessage(ByteBuffer data) 
+        {
+        Message m = null;
+        CommunicationsProtocol cp = null;
+        CommsManager cm = null;
+        ProtocolSelectionMessage psm = null;
+        ClientSession session = null;
+
         // if there is a wrapped session, simply forward the data to it
-        if (wrapped != null) {
+        if (wrapped != null)
+            {
             wrapped.receivedMessage(data);
             return;
-        }
-        
-        // no wrapped session -- look for a ProtocolSelectionMessage
-        try {
-            // the message contains a client identifier in the first
-            // 2 bytes, so ignore those
-            ReceivedMessage recv = MessagePacker.unpack(data);
-            Message m = recv.getMessage();
-            
-            // check the message type
-            if (!(m instanceof ProtocolSelectionMessage)) {
-                sendError(m, "Only ProtcolSelectionMessage allowed");
-                return;
             }
-            
-            ProtocolSelectionMessage psm = (ProtocolSelectionMessage) m;
-            CommsManager cm = WonderlandContext.getCommsManager();
 
-            // see if we have a protocol to match the request
-            CommunicationsProtocol cp = cm.getProtocol(psm.getProtocolName());
-            if (cp == null) {
-                sendError(m, "Protocol " + psm.getProtocolName() + " not found");
+        Charset charset = Charset.defaultCharset();
+        CharsetDecoder decoder = charset.newDecoder();
+        CharBuffer charBuffer = null;
+        try
+            {
+            charBuffer = decoder.decode(data);
+            }
+        catch (CharacterCodingException ex)
+            {
+            System.out.println("Error in decode - " + ex);
+            }
+        data.rewind();
+        System.out.println("ProtocolSessionListener - Incoming message = " + charBuffer.toString());
+        String proto = charBuffer.toString().substring(0, 5);
+        if(proto.equals("XYZZY"))
+            {
+            System.out.println("Found XYZZY protocol");
+            String protoVersion = charBuffer.toString().substring(6, 11);
+            String[] protoSplit = protoVersion.split(":");
+            System.out.println("Proto version = " + protoVersion + " splits = " + protoSplit[0] + protoSplit[1] + protoSplit[2]);
+            int protoOne = Integer.parseInt(protoSplit[0]);
+            int protoTwo = Integer.parseInt(protoSplit[1]);
+            int protoThree = Integer.parseInt(protoSplit[2]);
+            System.out.println("Found version " + protoOne + protoTwo + protoThree);
+            cm = WonderlandContext.getCommsManager();
+            cp = cm.getProtocol(proto);
+            if (cp == null)
+                {
+//                sendError(m, "Protocol XYZZY not found");
                 return;
-            }
-            
-            // see if the versions match
-            if (!cp.getVersion().isCompatible(psm.getProtocolVersion())) {
-                sendError(m, "Client version incompatible with server " + 
+                }
+            ProtocolVersion pver = new DefaultProtocolVersion(protoOne, protoTwo, protoThree);
+            if (!cp.getVersion().isCompatible(pver))
+                {
+                sendError(m, "Client version incompatible with server " +
                              "version " + cp.getVersion());
-            }
-            
-            
-            ClientSession session = getSession();
+                }
+            session = getSession();
             logger.info("Session " + session.getName() + " connected with " +
                         "protocol " + cp.getName());
-            
-            // all set -- set the wrapped session
-            wrapped = cp.createSessionListener(session, psm.getProtocolVersion());
-            if (wrapped instanceof ManagedObject) {
-                wrapped = new ManagedClientSessionWrapper(wrapped);
-            }
 
-            // TODO: is this the right thing to do, or should we only
-            // do this automatically for the Wonderland protocol?
+            // all set -- set the wrapped session
+            wrapped = cp.createSessionListener(session, pver, cp);
+            if (wrapped instanceof ManagedObject)
+                {
+                wrapped = new ManagedClientSessionWrapper(wrapped);
+                }
+            System.out.println("wrapped = " + wrapped);
             WonderlandClientID clientID = new WonderlandClientID(session);
             WonderlandContext.getUserManager().login(clientID);
-            
+
             // record the client connection
             this.protocol = cp;
+            System.out.println("Before recordConnect - protocol = " + cp + " name = " + cp.getName());
             recordConnect(cp, session);
-            
+
             // send an OK message
-            sendToSession(new OKMessage(psm.getMessageID()));
-        } catch (PackerException eme) {
-            sendError(eme.getMessageID(), null, eme);
-        } 
-    }
+            sendToSessionXYZZY("000:OK");
+            }
+        else
+            {
+            System.out.println("***************************** message in - " + charBuffer.toString() + " - proto = " + proto);
+        // no wrapped session -- look for a ProtocolSelectionMessage
+            try
+                {
+            // the message contains a client identifier in the first
+            // 2 bytes, so ignore those
+                ReceivedMessage recv = MessagePacker.unpack(data);
+                m = recv.getMessage();
+            
+            // check the message type
+                if (!(m instanceof ProtocolSelectionMessage))
+                    {
+                    System.out.println("***********************************************    message error");
+                    sendError(m, "Only ProtcolSelectionMessage allowed");
+                    return;
+                    }
+                System.out.println("************************************ passed protocol check");
+                psm = (ProtocolSelectionMessage) m;
+                cm = WonderlandContext.getCommsManager();
+
+            // see if we have a protocol to match the request
+                cp = cm.getProtocol(psm.getProtocolName());
+                if (cp == null)
+                    {
+                    sendError(m, "Protocol " + psm.getProtocolName() + " not found");
+                    return;
+                    }
+                if (!cp.getVersion().isCompatible(psm.getProtocolVersion()))
+                    {
+                    sendError(m, "Client version incompatible with server " +
+                             "version " + cp.getVersion());
+                    }
+                session = getSession();
+                logger.info("Session " + session.getName() + " connected with " +
+                        "protocol " + cp.getName());
+
+            // all set -- set the wrapped session
+                wrapped = cp.createSessionListener(session, psm.getProtocolVersion(), cp);
+                if (wrapped instanceof ManagedObject)
+                    {
+                    wrapped = new ManagedClientSessionWrapper(wrapped);
+                    }
+            // TODO: is this the right thing to do, or should we only
+            // do this automatically for the Wonderland protocol?
+                WonderlandClientID clientID = new WonderlandClientID(session);
+                WonderlandContext.getUserManager().login(clientID);
+
+            // record the client connection
+                this.protocol = cp;
+            System.out.println("Before recordConnect - protocol = " + cp + " name = " + cp.getName());
+                recordConnect(cp, session);
+
+            // send an OK message
+                sendToSession(new OKMessage(psm.getMessageID()));
+                }
+            catch (PackerException eme)
+                {
+                sendError(eme.getMessageID(), null, eme);
+                }
+            }
+            // see if the versions match
+            
+        }
 
     /**
      * Called when the delegate session is disconnected
@@ -238,6 +325,7 @@ public class ProtocolSessionListener
     {
         return getProtocolClientMap().get(protocol);
     }
+
     
     /**
      * Get the protocol in use by the given client
@@ -247,9 +335,14 @@ public class ProtocolSessionListener
      */
     public static CommunicationsProtocol getProtocol(ClientSession session)
     {
+        return WonderlandContext.getCommsManager().getProtocol(getProtocolClientMap().get(session));
+    }
+
+    public static String getProtocolName(ClientSession session)
+    {
         return getProtocolClientMap().get(session);
     }
-    
+
     /**
      * Get the session this listener represents.
      * @return the session connected to this listener
@@ -283,16 +376,28 @@ public class ProtocolSessionListener
      * Send a message to the session
      * @param message the message to send
      */
+    protected void sendToSessionXYZZY(String message)
+        {
+        System.out.println("In sendToSessionXYZZY - message = " + message);
+        byte[] by = message.getBytes();
+        ByteBuffer buf = ByteBuffer.wrap(by);
+        getSession().send(buf);
+        }
+    
+    /**
+     * Send a message to the session
+     * @param message the message to send
+     */
     protected void sendToSession(Message message) {
-        try {            
+        try {
             ByteBuffer buf = MessagePacker.pack(message, SessionInternalConnectionType.SESSION_INTERNAL_CLIENT_ID);
-        
+
             getSession().send(buf);
         } catch (PackerException ioe) {
             logger.log(Level.WARNING, "Unable to send message " + message, ioe);
         }
     }
-    
+
     /**
      * Record a client of the given type connecting
      * @param protocol the protocol the session connected with
@@ -301,12 +406,15 @@ public class ProtocolSessionListener
     protected void recordConnect(CommunicationsProtocol protocol,
                                  ClientSession session)
     {
+        System.out.println("Enter recordConnect - protocol = " + protocol.getName() + " session = " + session);
         ProtocolClientMap pcm = getProtocolClientMap();
-        
+
+//        System.out.println("Session list - " + pcm.get(protocol).size() + " pcm = " + pcm);
         DataManager dm = AppContext.getDataManager();
         dm.markForUpdate(pcm);
         
         pcm.add(protocol, session);
+//        System.out.println("Session list - " + pcm.get(protocol).size()  + " pcm = " + pcm);
     }
     
     /**
@@ -341,15 +449,21 @@ public class ProtocolSessionListener
             implements ManagedObject, Serializable
     {
         /** the key in the datastore */
-        private static final String DS_KEY = ProtocolClientMap.class.getName();
+//        private static final String DS_KEY = ProtocolClientMap.class.getName();
+        public static final String DS_KEY = ProtocolClientMap.class.getName();
         
         /** mapping from protocol to clients */
-        private Map<CommunicationsProtocol, ManagedReference<ProtocolClientSet>> clientMap = 
-                new HashMap<CommunicationsProtocol, ManagedReference<ProtocolClientSet>>();
+//        private Map<CommunicationsProtocol, ManagedReference<ProtocolClientSet>> clientMap =
+//                new HashMap<CommunicationsProtocol, ManagedReference<ProtocolClientSet>>();
+
+        private Map<String, ManagedReference<ProtocolClientSet>> clientMap =
+                new HashMap<String, ManagedReference<ProtocolClientSet>>();
         
         /** mapping from clients to protocols */
-        private Map<ManagedReference<ClientSession>, CommunicationsProtocol> protocolMap =
-                new HashMap<ManagedReference<ClientSession>, CommunicationsProtocol>();
+//        private Map<ManagedReference<ClientSession>, CommunicationsProtocol> protocolMap =
+//                new HashMap<ManagedReference<ClientSession>, CommunicationsProtocol>();
+        private Map<ManagedReference<ClientSession>, String> protocolMap =
+                new HashMap<ManagedReference<ClientSession>, String>();
         
         /**
          * Add a session to a communications protocol
@@ -357,16 +471,30 @@ public class ProtocolSessionListener
          * @param session the client session associated with the given protocol
          */
         public void add(CommunicationsProtocol protocol, ClientSession session) {
+            Collection c = null;
+            Iterator itr = null;
+
             DataManager dm = AppContext.getDataManager();
-                                
+
+            System.out.println("ClientMap size = " + clientMap.size());
+            c = clientMap.values();
+            itr = c.iterator();
+            while(itr.hasNext())
+                {
+                System.out.println(itr.next());
+                }
             // Add a reference to this client in the set of clients for
             // the given protocol.  If the set does not exist, then
             // create it.
-            ManagedReference<ProtocolClientSet> ref = clientMap.get(protocol);
+//            ManagedReference<ProtocolClientSet> ref = clientMap.get(protocol);
+            ManagedReference<ProtocolClientSet> ref = clientMap.get(protocol.getName());
             if (ref == null) {
+
+                System.out.println("Create a new protocolClientSet - clientMap = " + clientMap);
                 ProtocolClientSet sessions = new ProtocolClientSet();
                 ref = dm.createReference(sessions);
-                clientMap.put(protocol, ref);
+//                clientMap.put(protocol, ref);
+                clientMap.put(protocol.getName(), ref);
             }
             
             ManagedReference<ClientSession> sessionRef = dm.createReference(session);
@@ -375,7 +503,17 @@ public class ProtocolSessionListener
             sessions.add(sessionRef);
         
             // add a reference to the protocol from this client's session
-            protocolMap.put(sessionRef, protocol);
+//            protocolMap.put(sessionRef, protocol);
+            protocolMap.put(sessionRef, protocol.getName());
+
+            System.out.println("                                      ClientMap size = " + clientMap.size());
+            c = clientMap.values();
+            itr = c.iterator();
+            while(itr.hasNext())
+                {
+                System.out.println(itr.next());
+                }
+
         }
         
         /**
@@ -412,7 +550,7 @@ public class ProtocolSessionListener
          * the protocol
          */
         public Set<ClientSession> get(CommunicationsProtocol protocol) {
-            ManagedReference<ProtocolClientSet> ref = clientMap.get(protocol);
+            ManagedReference<ProtocolClientSet> ref = clientMap.get(protocol.getName());
             if (ref == null) {
                 return Collections.emptySet();
             }
@@ -433,10 +571,18 @@ public class ProtocolSessionListener
          * @return the protocol in use by that session, or null if the
          * sessionId does not exist
          */
-        public CommunicationsProtocol get(ClientSession session) {
+/*        public CommunicationsProtocol get(ClientSession session) {
             DataManager dm = AppContext.getDataManager();
             ManagedReference sessionRef = dm.createReference(session);
             
+            return protocolMap.get(sessionRef);
+        }
+
+ */
+        public String get(ClientSession session) {
+            DataManager dm = AppContext.getDataManager();
+            ManagedReference sessionRef = dm.createReference(session);
+
             return protocolMap.get(sessionRef);
         }
     }

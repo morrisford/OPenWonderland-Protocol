@@ -17,6 +17,9 @@
  */
 package org.jdesktop.wonderland.server.comms;
 
+import com.jme.bounding.BoundingVolume;
+import com.jme.math.Quaternion;
+import com.jme.math.Vector3f;
 import com.sun.sgs.app.AppContext;
 import com.sun.sgs.app.Channel;
 import com.sun.sgs.app.ChannelManager;
@@ -32,10 +35,16 @@ import com.sun.sgs.app.TaskManager;
 import java.io.Serializable;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.Charset;
+import java.nio.charset.CharsetDecoder;
+import java.security.Identity;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Queue;
@@ -43,8 +52,14 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
 import org.jdesktop.wonderland.common.ExperimentalAPI;
 import org.jdesktop.wonderland.common.auth.WonderlandIdentity;
+import org.jdesktop.wonderland.common.cell.CellID;
+import org.jdesktop.wonderland.common.cell.messages.CellHierarchyMessage;
+import org.jdesktop.wonderland.common.cell.messages.MovableAvatarMessage;
+import org.jdesktop.wonderland.common.cell.messages.TextChatMessage;
+import org.jdesktop.wonderland.common.cell.messages.ViewCreateResponseMessage;
 import org.jdesktop.wonderland.common.comms.ConnectionType;
 import org.jdesktop.wonderland.common.comms.SessionInternalConnectionType;
 import org.jdesktop.wonderland.common.comms.messages.AttachClientMessage;
@@ -54,6 +69,7 @@ import org.jdesktop.wonderland.common.comms.messages.SessionInitializationMessag
 import org.jdesktop.wonderland.common.messages.ErrorMessage;
 import org.jdesktop.wonderland.common.messages.Message;
 import org.jdesktop.wonderland.common.messages.MessageID;
+import org.jdesktop.wonderland.common.messages.MessageList;
 import org.jdesktop.wonderland.common.messages.MessagePacker;
 import org.jdesktop.wonderland.common.messages.MessagePacker.PackerException;
 import org.jdesktop.wonderland.common.messages.MessagePacker.ReceivedMessage;
@@ -61,12 +77,19 @@ import org.jdesktop.wonderland.common.security.Action;
 import org.jdesktop.wonderland.common.security.annotation.Actions;
 import org.jdesktop.wonderland.server.UserMO;
 import org.jdesktop.wonderland.server.UserManager;
+import org.jdesktop.wonderland.server.WonderlandContext;
 import org.jdesktop.wonderland.server.auth.ClientIdentityManager;
+import org.jdesktop.wonderland.server.cell.CellMO;
+import org.jdesktop.wonderland.server.cell.CellManagerMO;
+import org.jdesktop.wonderland.server.cell.view.AvatarCellMO;
+import org.jdesktop.wonderland.server.comms.ProtocolSessionListener.ProtocolClientMap;
+import org.jdesktop.wonderland.server.comms.WonderlandSessionListener.HandlerStore.HandlerRecord;
 import org.jdesktop.wonderland.server.security.ActionMap;
 import org.jdesktop.wonderland.server.security.Resource;
 import org.jdesktop.wonderland.server.security.ResourceMap;
 import org.jdesktop.wonderland.server.security.SecureTask;
 import org.jdesktop.wonderland.server.security.SecurityManager;
+
 
 /**
  * This is the default session listener is used by Wonderland clients.
@@ -119,12 +142,16 @@ public class WonderlandSessionListener
     /** the unique ID of this session listener */
     private BigInteger sessionID;
 
+    private static CommunicationsProtocol cp;
     /**
      * Create a new instance of WonderlandSessionListener for the given
      * session
      * @param session the session connected to this listener
      */
-    public WonderlandSessionListener(ClientSession session) {
+    public WonderlandSessionListener(ClientSession session, CommunicationsProtocol cp) {
+        this.cp = cp;
+        System.out.println("Entering WonderlandSessionListener - protocol = " + cp.getName());
+        
         DataManager dm = AppContext.getDataManager();
         sessionRef = dm.createReference(session);
         
@@ -139,11 +166,14 @@ public class WonderlandSessionListener
         // create a binding for ourself in the datastore.  This binding
         // is used by inner classes to securely complete operations on this
         // listener
+        System.out.println("In WonderlandSessionListener bindingName = " + getBindingName());
         dm.setBinding(getBindingName(), this);
+        System.out.println("SICT = " +  SessionInternalConnectionType.SESSION_INTERNAL_CLIENT_TYPE);
 
         // add internal handler
         ClientHandlerRef internalRef = getHandlerStore().getHandlerRef(
                     SessionInternalConnectionType.SESSION_INTERNAL_CLIENT_TYPE);
+        System.out.println("ref = " + internalRef);
         ((SessionInternalConnectionHandler) internalRef.get()).setListener(this);
         handlers.put(SESSION_INTERNAL_CLIENT_ID, internalRef);
         
@@ -154,16 +184,23 @@ public class WonderlandSessionListener
         sessionID = sessionRef.getId();
         WonderlandIdentity userID =
                AppContext.getManager(ClientIdentityManager.class).getClientID();
-        Message sim = new SessionInitializationMessage(sessionID, userID);
-        sendToSession(SESSION_INTERNAL_CLIENT_ID, sim);
+        if(cp.getName().equals("wonderland_client"))
+            {
+            Message sim = new SessionInitializationMessage(sessionID, userID);
+            sendToSession(SESSION_INTERNAL_CLIENT_ID, sim);
+            }
+
+        if(cp.getName().equals("XYZZY"))
+            {
+            String msg = "021:" + userID + ":" + sessionID.toString();
+            sendToSessionXYZZY(SESSION_INTERNAL_CLIENT_ID, msg);
+            }
     }
         
     /**
      * Initialize the session listener
      */
     public static void initialize() {
-        logger.fine("Initialize WonderlandSessionListener");
-        
         DataManager dm = AppContext.getDataManager();
         
         // create store for registered handlers
@@ -196,43 +233,196 @@ public class WonderlandSessionListener
      * simply forward the data to the delegate session
      * @param data the message data
      */
-    public void receivedMessage(ByteBuffer data) {
-        try {
+    public void receivedMessage(ByteBuffer data) 
+        {
+        short clientID = 0;
+        Message m = null;
+
+System.out.println("Enter WonderlandSessionListener - receivedMessage - protocol = " + cp.getName() + " DS_KEY = " + ProtocolClientMap.DS_KEY);
+
+//        ProtocolClientMap pcm = (ProtocolClientMap) AppContext.getDataManager().getBinding(ProtocolClientMap.DS_KEY);
+
+//        System.out.println(" the session list from pcm = " + pcm.get(cp).size() + " pcm = " + pcm);
+//        Set<ClientSession> cs = pcm.get(cp);
+//        Iterator itr = cs.iterator();
+//        while(itr.hasNext())
+//            {
+//            ClientSession cst = (ClientSession) itr.next();
+//            System.out.println("The sessions from pcm = " + cst.getName());
+//            }
+        Charset charset = Charset.defaultCharset();
+        CharsetDecoder decoder = charset.newDecoder();
+        CharBuffer charBuffer = null;
+        try
+            {
+            charBuffer = decoder.decode(data);
+            }
+        catch (CharacterCodingException ex)
+            {
+            System.out.println("Error in decode - " + ex);
+            }
+        data.rewind();
+        String proto = charBuffer.toString().substring(0, 5);
+        if(proto.equals("XYZZY"))
+            {
+            System.out.println("Found XYZZY protocol");
+
+            String[] messageTokens = charBuffer.toString().split(":");
+
+            Properties props = new Properties();
+
+            String theCode = messageTokens[1];
+            if(theCode.equals("100"))
+                {
+                m = new AttachClientMessage(new ConnectionType("__CellClient"), props);
+                clientID = Short.parseShort(messageTokens[2]);
+                System.out.println("Received an AttachClientMessage - clientID = " + clientID);
+                }
+            else if(theCode.equals("101"))
+                {
+                m = new AttachClientMessage(new ConnectionType("__CellCacheClient"), props);
+                clientID = Short.parseShort(messageTokens[2]);
+                System.out.println("Received an AttachClientMessage - clientID = " + clientID);
+                }
+            else if(theCode.equals("102"))
+                {
+                m = new AttachClientMessage(new ConnectionType("__TextChatClient"), props);
+                clientID = Short.parseShort(messageTokens[2]);
+                System.out.println("Received an TextChatAttachMessage - clientID = " + clientID);
+                }
+            else if(theCode.equals("110"))
+                {
+                m = CellHierarchyMessage.newSetAvatarMessage(messageTokens[2]);
+                clientID = Short.parseShort(messageTokens[2]);
+                System.out.println("Received a CellHierarchyMessage - AvatarMessage - clientID = " + clientID);
+                }
+            else if(theCode.equals("112"))
+                {
+                float locX = Float.parseFloat(messageTokens[4]);
+                float locY = Float.parseFloat(messageTokens[5]);
+                float locZ = Float.parseFloat(messageTokens[6]);
+                float rotX = Float.parseFloat(messageTokens[7]);
+                float rotY = Float.parseFloat(messageTokens[8]);
+                float rotZ = Float.parseFloat(messageTokens[9]);
+                float scale = Float.parseFloat(messageTokens[10]);
+                Quaternion quat = new Quaternion();
+                quat.fromAngles(rotX, rotY, rotZ);
+                Vector3f v3f = new Vector3f(locX, locY, locZ);
+                int trigger = Integer.parseInt(messageTokens[11]);
+                clientID = Short.parseShort(messageTokens[2]);
+
+                m = MovableAvatarMessage.newMoveRequestMessage(new CellID(Long.parseLong(messageTokens[3])), v3f, quat, trigger, Boolean.parseBoolean(messageTokens[12]), messageTokens[13]);
+//                m = MovableAvatarMessage.newMoveRequestMessage(new CellID(Long.parseLong(messageTokens[2])), v3f, quat);
+                }
+            else if(theCode.equals("113"))
+                {
+                m = new TextChatMessage(messageTokens[5], messageTokens[3], messageTokens[4]);
+                clientID = Short.parseShort(messageTokens[2]);
+                System.out.println("Received a TextChatMessage - clientID = " + clientID);
+                }
+            else if(theCode.equals("103"))
+                {
+                m = new AttachClientMessage(new ConnectionType("__PresenceManagerConnection"), props);
+                clientID = Short.parseShort(messageTokens[2]);
+                System.out.println("Received a Presence Attach - clientID = " + clientID);
+                }
+            else if(theCode.equals("104"))
+                {
+                m = new AttachClientMessage(new ConnectionType("__PlacemarksConfigConnection"), props);
+                clientID = Short.parseShort(messageTokens[2]);
+                System.out.println("Received a Placemark Attach - clientID = " + clientID);
+                }
+            }
+//        if(cp.getName().equals("wonderland_client"))
+        else
+            {
+            try
+                {
+
             // extract the message and client id
-            ReceivedMessage recv = MessagePacker.unpack(data);
-            Message m = recv.getMessage();
-            short clientID = recv.getClientID();
-            
+                ReceivedMessage recv = MessagePacker.unpack(data);
+                m = recv.getMessage();
+                clientID = recv.getClientID();
+                }
+            catch (PackerException eme)
+                {
+                logger.log(Level.WARNING, "Error extracting message from client",
+                       eme);
+
+            // if possible, send a reply to the client
+                if (eme.getMessageID() != null)
+                    {
+                    sendError(eme.getMessageID(), eme.getClientID(), eme);
+                    }
+                }
+            System.out.println("Received wonderland_client message " + m);
+            if(m instanceof CellHierarchyMessage)
+                {
+                CellHierarchyMessage mm = (CellHierarchyMessage)m;
+                System.out.println("Type = " + mm.getActionType());
+                System.out.println("CellId = " + mm.getCellID());
+                System.out.println("ParentId = " + mm.getParentID());
+                System.out.println("LocalBounds = " + mm.getLocalBounds());
+                System.out.println("ComputedBounds = " + mm.getComputedBounds());
+                System.out.println("cellClassName = " + mm.getCellClassName());
+                System.out.println("cellTransform = " + mm.getCellTransform());
+                System.out.println("cellClientState = " + mm.getSetupData());
+                System.out.println("avatarID = " + mm.getViewID());
+                System.out.println("cellName = " + mm.getCellName());
+                System.out.println("clientID = " + clientID);
+                }
+            else if(m instanceof MovableAvatarMessage)
+                {
+                System.out.println("MovableAvatarMessage");
+                MovableAvatarMessage mae = (MovableAvatarMessage)m;
+                System.out.println("Rotation " + mae.getRotation());
+                System.out.println("Translation " + mae.getTranslation());
+                System.out.println("Scale " + mae.getScale());
+                System.out.println("Trigger " + mae.getTrigger());
+                System.out.println("Pressed " + mae.isPressed());
+                System.out.println("Animation " + mae.getAnimationName());
+                }
+            else 
+                {
+                System.out.println("The message = " + m);
+                }
+            }
+
+        System.out.println("Just before looking for the handler - clientID = " + clientID);
             // find the handler
-            ClientConnectionHandler handler = getHandler(clientID);
-            if (handler == null) {
-                logger.fine("Session " + getSession().getName() + 
+        ClientConnectionHandler handler = getHandler(clientID);
+        if (handler == null)
+            {
+            logger.fine("Session " + getSession().getName() + 
                             " unknown handler ID: " + clientID);
-                sendError(m.getMessageID(), clientID,
+            sendError(m.getMessageID(), clientID,
                           "Unknown handler ID: " + clientID);
-                return;
+            return;
             }
             
-            if (logger.isLoggable(Level.FINEST)) {
-                logger.finest("Session " + getSession().getName() + 
+        if (logger.isLoggable(Level.FINEST))
+            {
+            logger.finest("Session " + getSession().getName() + 
                               " received message " + m + 
                               " for client ID" + clientID + 
                               " handled by " + handler.getConnectionType());
             }
 
             // determine if security is needed
-            Resource resource = null;
-            if (handler instanceof SecureClientConnectionHandler) {
-                SecureClientConnectionHandler sec =
+        Resource resource = null;
+        if (handler instanceof SecureClientConnectionHandler)
+            {
+            SecureClientConnectionHandler sec =
                         (SecureClientConnectionHandler) handler;
-                resource = sec.checkMessage(getWonderlandClientID(), m);
+            resource = sec.checkMessage(getWonderlandClientID(), m);
             }
 
             // get the actions associated with this message
-            Set<Action> actions = getActions(m.getClass());
+       Set<Action> actions = getActions(m.getClass());
 
-            if (logger.isLoggable(Level.FINEST)) {
-                logger.finest("Session " + getSession().getName() +
+       if (logger.isLoggable(Level.FINEST))
+            {
+            logger.finest("Session " + getSession().getName() +
                               " security for message " + m +
                               " resource: " + resource +
                               " actions: " + actions.size());
@@ -242,23 +432,17 @@ public class WonderlandSessionListener
             // we need to query the resource for the given actions, and only
             // handle the message if the query returns the required
             // permissions
-            if (resource != null && !actions.isEmpty()) {
-                receiveSecure(resource, clientID, m, actions);
-            } else {
-                // no security, just handle the message
-                WonderlandClientSender sender = senders.get(clientID);
-                handler.messageReceived(sender, getWonderlandClientID(), m);
+        if (resource != null && !actions.isEmpty())
+            {
+            receiveSecure(resource, clientID, m, actions);
             }
-        } catch (PackerException eme) {
-            logger.log(Level.WARNING, "Error extracting message from client", 
-                       eme);
-            
-            // if possible, send a reply to the client
-            if (eme.getMessageID() != null) {
-                sendError(eme.getMessageID(), eme.getClientID(), eme);
+        else
+            {
+                // no security, just handle the message
+            WonderlandClientSender sender = senders.get(clientID);
+            handler.messageReceived(sender, getWonderlandClientID(), m);
             }
         }
-    }
 
     /**
      * Set up security and make a secure message request.  This will spawn a new
@@ -318,7 +502,9 @@ public class WonderlandSessionListener
     public static void registerClientHandler(ClientConnectionHandler handler) {
         logger.fine("Register client handler for type " + 
                     handler.getConnectionType());
-        
+
+        System.out.println("Register a handler for " + handler + " - type = " + handler.getConnectionType());
+
         HandlerStore store = getHandlerStore();
         store.register(handler);
                 
@@ -327,6 +513,7 @@ public class WonderlandSessionListener
         
         // notify the handler
         handler.registered(store.getSender(handler.getConnectionType()));
+//        handler.setProtocol(cp);
     }
     
     /**
@@ -517,6 +704,7 @@ public class WonderlandSessionListener
         // get the ID for this type
         WonderlandClientSenderImpl sender = getHandlerStore().getSender(type);
         short clientID = sender.getClientID();
+        System.out.println("In finish attach - clientID = " + clientID);
         
         // make sure this isn't a duplicate join
         if (handlers.containsKey(Short.valueOf(clientID))) {
@@ -533,9 +721,40 @@ public class WonderlandSessionListener
         // add handler to our list
         handlers.put(Short.valueOf(clientID), ref);
         
+        if(cp.getName().equals("wonderland_client"))
+            {
         // send response message
-        Message resp = new AttachedClientMessage(messageID, clientID);
-        sendToSession(SESSION_INTERNAL_CLIENT_ID, resp);
+            Message resp = new AttachedClientMessage(messageID, clientID);
+            sendToSession(SESSION_INTERNAL_CLIENT_ID, resp);
+            }
+        if(cp.getName().equals("XYZZY"))
+            {
+            if(type.equals(new ConnectionType("__CellClient")))
+                {
+                String msg = "022:" + clientID;
+                sendToSessionXYZZY(clientID, msg);
+                }
+            if(type.equals(new ConnectionType("__CellCacheClient")))
+                {
+                String msg = "024:" + clientID;
+                sendToSessionXYZZY(clientID, msg);
+                }
+            if(type.equals(new ConnectionType("__TextChatClient")))
+                {
+                String msg = "027:" + clientID;
+                sendToSessionXYZZY(clientID, msg);
+                }
+            if(type.equals(new ConnectionType("__PresenceManagerConnection")))
+                {
+                String msg = "028:" + clientID;
+                sendToSessionXYZZY(clientID, msg);
+                }
+            if(type.equals(new ConnectionType("__PlacemarksConfigConnection")))
+                {
+                String msg = "029:" + clientID;
+                sendToSessionXYZZY(clientID, msg);
+                }
+            }
         
         // add this session to the sender
         sender.addSession(session);
@@ -631,7 +850,15 @@ public class WonderlandSessionListener
      */
     protected void sendError(MessageID messageID, short clientID, String error)
     {
-        sendError(messageID, clientID, error, null);
+        if(cp.getName().equals("wonderland_client"))
+            {
+            sendError(messageID, clientID, error, null);
+            }
+        if(cp.getName().equals("XYZZY"))
+            {
+            String msg = "010:" + messageID.toString() + ":" + clientID + ":" + error;
+            sendToSessionXYZZY(clientID, msg);
+            }
     }
     
     /**
@@ -643,7 +870,15 @@ public class WonderlandSessionListener
     protected void sendError(MessageID messageID, short clientID, 
                              Throwable cause)
     {
-        sendError(messageID, clientID, null, cause);
+        if(cp.getName().equals("wonderland_client"))
+            {
+            sendError(messageID, clientID, null, cause);
+            }
+        if(cp.getName().equals("XYZZY"))
+            {
+            String msg = "011:" + messageID.toString() + ":" + clientID + ":" + cause.toString();
+            sendToSessionXYZZY(clientID, msg);
+            }
     }
     
     /**
@@ -656,8 +891,16 @@ public class WonderlandSessionListener
     protected void sendError(MessageID messageID, short clientID, 
                              String error, Throwable cause)
     {
-        ErrorMessage msg = new ErrorMessage(messageID, error, cause);
-        sendToSession(clientID, msg);
+        if(cp.getName().equals("wonderland_client"))
+            {
+            ErrorMessage msg = new ErrorMessage(messageID, error, cause);
+            sendToSession(clientID, msg);
+            }
+        if(cp.getName().equals("XYZZY"))
+            {
+            String msg = "012:" + messageID.toString() + ":" + clientID + ":" + error + ":" + cause.toString();
+            sendToSessionXYZZY(clientID, msg);
+            }
     }
    
     /**
@@ -672,10 +915,20 @@ public class WonderlandSessionListener
             logger.finest("Session " + getSession().getName() + " send " +
                           "message " + message + " to client " + clientID);
         }
+        System.out.println("in main sendToSession with clientID = " + clientID);
         
         getSession().send(serializeMessage(message, clientID));
     }
-        
+
+    protected void sendToSessionXYZZY(short clientID, String message)
+        {
+        System.out.println("In WonderlandSessionListener sendToSession - message = " + message);
+        byte[] by = message.getBytes();
+        ByteBuffer buf = ByteBuffer.wrap(by);
+        getSession().send(buf);
+        }
+
+
     /**
      * Serialize the given message into a ByteBuffer to send to a client of the
      * given type.
@@ -815,29 +1068,349 @@ public class WonderlandSessionListener
             return channelRef.get().hasSessions();
         }
 
-        public void send(Message message) {
-            send(channelRef.get(), message);
-        }
+        public void send(Message message)
+            {
+            System.out.println("Enter send #1 in WonderlandSessionListener");
+            if(message instanceof ViewCreateResponseMessage)
+                {
+                System.out.println("ViewCreateResponseMessage");
+                }
+            else if(message instanceof MessageList)
+                {
+                System.out.println("MessageList");
+                MessageList ml = (MessageList)message;
+                List list = ml.getMessages();
+                System.out.println("MessageList size = " + ml.size());
+                Iterator itr = list.iterator();
+                while(itr.hasNext())
+                    {
+                    Message msg = (Message) itr.next();
+                    System.out.println("MessageList message = " + msg);
+                    if(msg instanceof CellHierarchyMessage)
+                        {
 
-        public void send(WonderlandClientID wlID, Message message) {
-            // issue 963: session may be null
-            ClientSession session = wlID.getSession();
-            if (session != null) {
-                session.send(serializeMessage(message, clientID));
+                        }
+                    }
+                }
+            else if(message instanceof MovableAvatarMessage)
+                {
+                System.out.println("MovableAvatarMessage");
+                }
+            else
+                {
+                System.out.println("Send message - " + message);
+                }
+
+            send(channelRef.get(), message);
             }
-        }
+
+        public void send(WonderlandClientID wlID, Message message) 
+            {
+            Vector3f comp = null;
+            String compBvType = null;
+            String theName = null;
+            String vcrm = null;
+
+            System.out.println("Enter send #2 in WonderlandSessionListener - wlID = " + wlID);
+            if(message instanceof ViewCreateResponseMessage)
+                {
+                System.out.println("ViewCreateResponseMessage");
+                }
+            else if(message instanceof MessageList)
+                {
+                System.out.println("MessageList");
+                }
+            else if(message instanceof MovableAvatarMessage)
+                {
+                System.out.println("MovableAvatarMessage");
+                }
+            else
+                {
+                System.out.println("message type - " + message);
+                }
+            ClientSession session = wlID.getSession();
+            ProtocolClientMap pcm = (ProtocolClientMap) AppContext.getDataManager().getBinding(ProtocolClientMap.DS_KEY);
+            System.out.println("The protocol for this session = " + pcm.get(session));
+            String prot = pcm.get(session);
+
+            if(prot.equals("wonderland_client"))
+                {
+            // issue 963: session may be null
+                if (session != null)
+                    {
+                    session.send(serializeMessage(message, clientID));
+                    System.out.println("Send to wonderland_client - " + message);
+                    }
+                }
+            else if(prot.equals("XYZZY"))
+                {
+                if(message instanceof ViewCreateResponseMessage)
+                    {
+                    System.out.println("Send ViewCreateResponseMessage");
+                    ViewCreateResponseMessage vcr = (ViewCreateResponseMessage)message;
+                    vcrm = "025:" + wlID.getID() + ":" + vcr.getViewCellID() + ":" + UserManager.getUserManager().getUser(wlID).getUsername() + ":";
+                    byte[] by = vcrm.getBytes();
+                    ByteBuffer buf = ByteBuffer.wrap(by);
+                    session.send(buf);
+                    }
+                else if(message instanceof MessageList)
+                    {
+                    System.out.println("Send MessageList");
+                    MessageList ml = (MessageList)message;
+                    List list = ml.getMessages();
+                    System.out.println("MessageList size = " + ml.size());
+                    Iterator itr = list.iterator();
+                    while(itr.hasNext())
+                        {
+                        Message msg = (Message) itr.next();
+                        System.out.println("MessageList message = " + msg);
+                        if(msg instanceof CellHierarchyMessage)
+                            {
+                            System.out.println("CellHierarchyMessage");
+                            CellHierarchyMessage mm = (CellHierarchyMessage)msg;
+                            System.out.println("Type = " + mm.getActionType());
+                            System.out.println("CellId = " + mm.getCellID());
+                            System.out.println("ParentId = " + mm.getParentID());
+                            System.out.println("LocalBounds = " + mm.getLocalBounds());
+                            System.out.println("ComputedBounds = " + mm.getComputedBounds());
+                            System.out.println("cellClassName = " + mm.getCellClassName());
+                            System.out.println("cellTransform = " + mm.getCellTransform());
+                            System.out.println("cellClientState = " + mm.getSetupData());
+                            System.out.println("avatarID = " + mm.getViewID());
+                            System.out.println("cellName = " + mm.getCellName());
+                            System.out.println("clientID = " + clientID);
+
+
+                            if(mm.getActionType().toString().equals("LOAD_CELL"))
+                                {
+                                System.out.println("Found LOAD_CELL = " + mm.getActionType());
+                                BoundingVolume locbv = mm.getLocalBounds();
+                                Vector3f center = locbv.getCenter();
+                                if(mm.getComputedBounds() != null)
+                                    {
+                                    BoundingVolume compbv = mm.getComputedBounds();
+                                    comp = compbv.getCenter();
+                                    compBvType = compbv.getType().toString();
+                                    }
+                                else
+                                    {
+                                    comp = new Vector3f(0f, 0f, 0f);
+                                    compBvType = "";
+                                    }
+
+                                Vector3f cellLoc = mm.getCellTransform().getTranslation(null);
+                                Quaternion cellRot = mm.getCellTransform().getRotation(null);
+                                float[] angles = cellRot.toAngles(null);
+
+                                String[] cellStuff = mm.getCellClassName().split("\\.");
+
+                                CellMO cmmo = WonderlandContext.getCellManager().getCell(mm.getCellID());
+                                if(cmmo instanceof AvatarCellMO)
+                                    {
+                                    AvatarCellMO acmo = (AvatarCellMO)cmmo;
+                                    theName = acmo.getUser().getUsername();
+                                    }
+                                else
+                                    {
+//                                theName = WonderlandContext.getCellManager().getCell(mm.getCellID()).toString();
+                                    theName = "NotAvatar";
+                                    }
+                                vcrm = "030:" + wlID.getID() + ":"
+                                    + mm.getActionType() + ":"
+                                    + mm.getCellID() + ":"
+                                    + mm.getParentID() + ":"
+                                    + locbv.getType() + ":"
+                                    + center.x + ":"
+                                    + center.y + ":"
+                                    + center.z + ":"
+                                    + compBvType + ":"
+                                    + comp.x + ":"
+                                    + comp.y + ":"
+                                    + comp.z + ":"
+                                    + cellLoc.x + ":"
+                                    + cellLoc.y + ":"
+                                    + cellLoc.z + ":"
+                                    + angles[0] + ":"
+                                    + angles[1] + ":"
+                                    + angles[2] + ":"
+                                    + mm.getViewID() + ":"
+                                    + mm.getCellName() + ":"
+                                    + cellStuff[cellStuff.length - 1] + ":"
+                                    + theName + ":";
+                                }
+                            else
+                                {
+                                System.out.println("Found UNLOAD_CELL = " + mm.getActionType());
+
+                                CellMO cmmo = WonderlandContext.getCellManager().getCell(mm.getCellID());
+                                if(cmmo instanceof AvatarCellMO)
+                                    {
+                                    AvatarCellMO acmo = (AvatarCellMO)cmmo;
+                                    theName = acmo.getUser().getUsername();
+                                    }
+                                else
+                                    {
+//                                theName = WonderlandContext.getCellManager().getCell(mm.getCellID()).toString();
+                                    theName = "NotAvatar";
+                                    }
+
+                                vcrm = "030:" + wlID.getID() + ":"
+                                    + mm.getActionType() + ":"
+                                    + mm.getCellID() + ":"
+                                    + mm.getParentID() + ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  ":"
+                                    +  theName + ":";
+                                }
+                            byte[] by = vcrm.getBytes();
+                            ByteBuffer buf = ByteBuffer.wrap(by);
+                            System.out.println("Sending " + vcrm);
+                            session.send(buf);
+                            }
+                        else
+                            {
+                            System.out.println("In send #2 - in message list - send " + message);
+                            }
+                        }
+                    }
+                else if(message instanceof TextChatMessage)
+                    {
+                    TextChatMessage tcm = (TextChatMessage)message;
+                    String tcmm = "026:" + wlID.getID() + ":" + tcm.getFromUserName() + ":" + tcm.getToUserName() + ":" + tcm.getTextMessage() + ":";
+                    byte[] by = tcmm.getBytes();
+                    ByteBuffer buf = ByteBuffer.wrap(by);
+                    session.send(buf);
+                    }
+                else
+                    {
+                    System.out.println("In send the message = " + message);
+                    }
+                }
+            }
 
         public void send(Set<WonderlandClientID> wlIDs, Message message)
         {
+            System.out.println("Enter send #3 in WonderlandSessionListener");
+            if(message instanceof ViewCreateResponseMessage)
+                {
+                System.out.println("ViewCreateResponseMessage");
+                }
+            else if(message instanceof MessageList)
+                {
+                System.out.println("MessageList");
+                }
+            else if(message instanceof MovableAvatarMessage)
+                {
+                System.out.println("MovableAvatarMessage");
+                }
+
             // send to each individual session
             for (WonderlandClientID wlID : wlIDs) {
                 send(wlID, message);
             }
         }
 
-        public void send(Channel channel, Message message) {
-            channel.send(null, serializeMessage(message, clientID));
-        }
+        public void send(Channel channel, Message message)
+            {
+            Channel chan2 = null;
+
+            Set XYZZYSet = new HashSet();
+            boolean XYZZYFound = false;
+
+            System.out.println("Enter send #4 in WonderlandSessionListener");
+            
+            ProtocolClientMap pcm = (ProtocolClientMap) AppContext.getDataManager().getBinding(ProtocolClientMap.DS_KEY);
+
+            Iterator itr = channel.getSessions();
+            while(itr.hasNext())
+                {
+                ClientSession clientSession = (ClientSession) itr.next();
+                String prot = pcm.get(clientSession);
+                if(prot.equals("XYZZY"))
+                    {
+                    XYZZYSet.add(clientSession);
+                    XYZZYFound = true;
+                    }
+                }
+
+            String chan = channel.getName();
+            System.out.println("Channel name = " + chan);
+            String chanAlt = "Alt:" + chan;
+            try
+                {
+                chan2 = AppContext.getChannelManager().getChannel(chanAlt);
+                }
+            catch(Exception ex)
+                {
+                System.out.println("Exception occurred on get Alt channel" + ex);
+                ChannelManager cm = AppContext.getChannelManager();
+
+                chan2 = cm.createChannel(chanAlt,
+                                           null,
+                                           Delivery.RELIABLE);
+                }
+
+            if(XYZZYFound)
+                {
+                chan2.join(XYZZYSet);
+                channel.leave(XYZZYSet);
+                }
+
+            if(chan2.hasSessions())
+                {
+                if(message instanceof ViewCreateResponseMessage)
+                    {
+                    System.out.println("ViewCreateResponseMessage");
+                    }
+                else if(message instanceof MessageList)
+                    {
+                    System.out.println("MessageList");
+                    }
+                else if(message instanceof MovableAvatarMessage)
+                    {
+                    System.out.println("MovableAvatarMessage");
+                    MovableAvatarMessage mae = (MovableAvatarMessage)message;
+
+                    Vector3f loc = mae.getTranslation();
+                    Quaternion quat = mae.getRotation();
+                    float[] angles = quat.toAngles(null);
+
+
+                    String msg = "XYZZY:112:" + clientID + ":" + mae.getSenderID() + ":" + loc.x + ":" + loc.y + ":" + loc.z
+                            + ":" + angles[0] + ":" + angles[1] + ":" + angles[2] + ":" + mae.getScale() + ":" + mae.getTrigger()
+                            + ":" + mae.isPressed() + ":" + mae.getAnimationName() + ":";
+                    System.out.println("Sending message to XYZZY - " + msg);
+                    byte[] by = msg.getBytes();
+                    ByteBuffer buf = ByteBuffer.wrap(by);
+                    chan2.send(null, buf);
+
+                    }
+                else
+                    {
+                    System.out.println("Send not sent to XYZZY - " + message);
+                    }
+                }
+            if(channel.hasSessions())
+                {
+                System.out.println("Send to wonderland_client - " + message);
+                channel.send(null, serializeMessage(message, clientID));
+                }
+            }
         
         /**
          * Get the clientID for this sender
@@ -866,6 +1439,15 @@ public class WonderlandSessionListener
         private void removeSession(ClientSession session) {
             channelRef.get().leave(session);
         }
+/*
+        private void sendToSessionXYZZY(WonderlandClientID wlID, String message)
+            {
+            System.out.println("In XYZZYSessionListener sendToSession - message = " + message);
+            byte[] by = message.getBytes();
+            ByteBuffer buf = ByteBuffer.wrap(by);
+            wlID.getSession().send(buf);
+            }
+*/
     }
       
     /**
@@ -874,6 +1456,7 @@ public class WonderlandSessionListener
     static class SessionInternalConnectionHandler implements ClientConnectionHandler, Serializable {
         /** the listener to call back to */
         private ManagedReference<WonderlandSessionListener> listener;
+        private CommunicationsProtocol protocol;
         
         /**
          * Set the session listener
@@ -917,6 +1500,10 @@ public class WonderlandSessionListener
                 DetachClientMessage dcm = (DetachClientMessage) message;
                 listener.get().handleDetach(dcm.getClientID(), false);
             }
+        }
+
+        public void setProtocol(CommunicationsProtocol cp) {
+            this.protocol = cp;
         }
     }
     
@@ -1020,6 +1607,7 @@ public class WonderlandSessionListener
             
             for (HandlerRecord record : handlers.values()) {
                 out.add(record.ref.get());
+//                System.out.println("Handler ref = " + record.ref.get() + " type = " + record.ref.handler.getConnectionType());
             }
             
             return out;
